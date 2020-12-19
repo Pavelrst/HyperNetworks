@@ -1,12 +1,46 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.parameter import Parameter
-from dataloaders import get_dataloaders
 from torch.autograd import Variable
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import numpy as np
+
+import torchvision
+import torchvision.transforms as transforms
+import torch
+
+
+def get_dataloaders(train_batch_size=128, test_batch_size=1):
+    ########### Data Loader ###############
+
+    transform_train = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    ])
+
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    ])
+
+    trainset = torchvision.datasets.CIFAR10(root='../data', train=True,
+                                            download=True, transform=transform_train)
+    trainloader = torch.utils.data.DataLoader(trainset, batch_size=train_batch_size,
+                                              shuffle=True, num_workers=0)
+
+    testset = torchvision.datasets.CIFAR10(root='../data', train=False,
+                                           download=True, transform=transform_test)
+    testloader = torch.utils.data.DataLoader(testset, batch_size=test_batch_size,
+                                             shuffle=False, num_workers=0)
+
+    classes = ('plane', 'car', 'bird', 'cat',
+               'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
+
+    return trainloader, testloader
+
 
 class PrimaryNetwork(nn.Module):
     '''
@@ -34,6 +68,7 @@ class PrimaryNetwork(nn.Module):
         x = F.relu(x)
         return x
 
+
 class HyperNetwork(nn.Module):
     '''
     Hypernetwork, predicts weights
@@ -41,9 +76,9 @@ class HyperNetwork(nn.Module):
     '''
     def __init__(self):
         super().__init__()
-        self.out1_shape = torch.Size([200, 3072])
-        self.out2_shape = torch.Size([100, 200])
-        self.out3_shape = torch.Size([10, 100])
+        self.out1_shape = torch.Size([-1, 200, 3072])
+        self.out2_shape = torch.Size([-1, 100, 200])
+        self.out3_shape = torch.Size([-1, 10, 100])
 
         self.fc1 = nn.Linear(in_features=3072, out_features=100)
         self.fc2 = nn.Linear(in_features=100, out_features=100)
@@ -71,9 +106,11 @@ class HyperNetwork(nn.Module):
         out2 = w2.view(self.out2_shape)
         out3 = w3.view(self.out3_shape)
 
-        assert out1.shape == self.out1_shape
-        assert out2.shape == self.out2_shape
-        assert out3.shape == self.out3_shape
+        # Mean reduce the weights if they batch,
+        # or only remove batch dim if x single sample
+        out1 = torch.mean(out1, dim=0)
+        out2 = torch.mean(out2, dim=0)
+        out3 = torch.mean(out3, dim=0)
 
         return out1, out2, out3
 
@@ -84,10 +121,12 @@ class Model(nn.Module):
         self.primary_network = PrimaryNetwork()  # List of functionals
         self.hyper_network = HyperNetwork()
 
-    def forward(self, x):
-        w = self.hyper_network(x)
-        x = self.primary_network(x, w)
-        return x
+    def forward(self, x_batch):
+        x_batch_reduced = torch.mean(x_batch, dim=0)
+        w = self.hyper_network(x_batch_reduced)
+        logits_batch = self.primary_network(x_batch, w)
+        return logits_batch
+
 
 class RefModel(nn.Module):
     '''
@@ -96,11 +135,11 @@ class RefModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.fc1 = nn.Linear(3072, 200)
-        self.act1 = nn.LeakyReLU()
+        self.act1 = nn.ReLU()
         self.fc2 = nn.Linear(200, 100)
-        self.act2 = nn.LeakyReLU()
+        self.act2 = nn.ReLU()
         self.fc3 = nn.Linear(100, 10)
-        self.act3 = nn.Softmax(0)
+        self.act3 = nn.ReLU()
 
     def forward(self, x):
         x = self.act1(self.fc1(x))
@@ -108,60 +147,57 @@ class RefModel(nn.Module):
         x = self.act3(self.fc3(x))
         return x
 
+
+
 def main():
-    B = 250
-    epochs = 10
-    batches_per_epoch = -5 # for debuging
-    trainloader, testloader = get_dataloaders(train_batch_size=B, test_batch_size=1)
+    batchsize = 512
+    epochs = 2
+    trainloader, testloader = get_dataloaders(train_batch_size=batchsize, test_batch_size=batchsize)
 
     model = Model().to('cuda')
-    optimizer = torch.optim.Adam(model.hyper_network.parameters(), lr=0.0001)
+    optimizer = torch.optim.Adam(model.hyper_network.parameters(), lr=0.001)
     #model = RefModel().to('cuda')
-    #optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
+    #optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
     criterion = nn.CrossEntropyLoss()
 
     total_loss_list = []
     for epoch in range(epochs):
         epoch_loss_list = []
-        for batch_idx, batch in enumerate(tqdm(trainloader)):
-            if batches_per_epoch > 0:
-                if batch_idx > batches_per_epoch:
-                    break
+        for batch in tqdm(trainloader):
             optimizer.zero_grad()
             inputs, labels = batch
-            batchsize = batch[0].shape[0]
-            for idx in range(batchsize):
-                input = inputs[idx]
-                label = labels[idx]
-                input, label = Variable(input.cuda()), Variable(label.cuda())
-                logits = model(input.view(3072))
-                if idx == 0:
-                    batch_loss = criterion(logits.unsqueeze(0), label.unsqueeze(0)) / batchsize
-                else:
-                    batch_loss += criterion(logits.unsqueeze(0), label.unsqueeze(0)) / batchsize
+            inputs, labels = Variable(inputs.cuda()), Variable(labels.cuda())
+            inputs = inputs.view(-1, 3072)
+
+            logits = model(inputs)
+            batch_loss = criterion(logits, labels)
             batch_loss.backward()
             optimizer.step()
             epoch_loss_list.append(batch_loss.item())
 
         total_loss_list.append(np.mean(np.array(epoch_loss_list)))
 
+        with torch.no_grad():
+            correct = 0.
+            total = 0.
+            acc_list = []
+            for data in tqdm(testloader):
+                inputs, labels = data
+                inputs = Variable(inputs.cuda())
+                inputs = inputs.view(-1, 3072)
+
+                logits = model(inputs)
+                predicted = torch.argmax(logits, dim=1)
+                total += labels.size(0)
+                correct += (predicted.cpu() == labels).sum()
+
+            accuracy = ((100. * correct) / total).cpu().detach().item()
+            acc_list.append(accuracy)
+            print('Epoch {} Accuracy: {:.2f}'.format(epoch, accuracy))
+
     plt.plot(total_loss_list, label='training loss')
+    plt.plot(acc_list, label='val acc')
     plt.xlabel('epoch')
     plt.show()
-
-    correct = 0.
-    total = 0.
-    for data in tqdm(testloader):
-        image, label = data
-        logits = model(Variable(image.cuda()).view(3072))
-        predicted = torch.argmax(logits.cpu().data)
-        total += label.size(0)
-        correct += (predicted == label).sum()
-
-
-    accuracy = (100. * correct) / total
-    print('Accuracy: %.4f %%' % (accuracy))
-
-
 main()
